@@ -1,7 +1,8 @@
 import math
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
-
+from io import StringIO
+import requests
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
@@ -113,7 +114,44 @@ def normalize_symbol(symbol: str) -> str:
         return symbol
     return f"{symbol}.NS"
 
+NIFTY500_CSV_URL = "https://nsearchives.nseindia.com/content/indices/ind_nifty500list.csv"
 
+
+@st.cache_data(ttl=24 * 3600, show_spinner=False)
+def load_nifty500_symbols() -> tuple[list[str], pd.DataFrame]:
+    """
+    Loads official Nifty 500 constituents from NSE archives.
+    Returns Yahoo-compatible symbols like RELIANCE.NS.
+    """
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0.0.0 Safari/537.36"
+        ),
+        "Accept": "text/csv,application/csv,text/plain,*/*",
+    }
+
+    response = requests.get(NIFTY500_CSV_URL, headers=headers, timeout=30)
+    response.raise_for_status()
+
+    df = pd.read_csv(StringIO(response.text))
+    df.columns = [c.strip() for c in df.columns]
+
+    if "Symbol" not in df.columns:
+        raise ValueError(f"Could not find Symbol column. Columns found: {df.columns.tolist()}")
+
+    symbols = (
+        df["Symbol"]
+        .dropna()
+        .astype(str)
+        .map(normalize_symbol)
+        .drop_duplicates()
+        .tolist()
+    )
+
+    return symbols, df
+    
 def display_symbol(symbol: str) -> str:
     return str(symbol).replace(".NS", "").replace(".BO", "")
 
@@ -215,36 +253,54 @@ def standardize_fundamental_df(df: pd.DataFrame) -> pd.DataFrame:
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_price_data(symbols: Tuple[str, ...], period: str) -> pd.DataFrame:
     frames = []
+    chunk_size = 75
 
-    for symbol in symbols:
+    for start in range(0, len(symbols), chunk_size):
+        chunk = list(symbols[start:start + chunk_size])
+
         try:
             data = yf.download(
-                symbol,
+                tickers=chunk,
                 period=period,
                 interval="1d",
                 auto_adjust=False,
                 progress=False,
-                threads=False,
+                group_by="ticker",
+                threads=True,
             )
 
             if data.empty:
                 continue
 
-            data = data.reset_index()
+            if len(chunk) == 1:
+                symbol = chunk[0]
+                tmp = data.reset_index().copy()
 
-            if isinstance(data.columns, pd.MultiIndex):
-                data.columns = [c[0] if isinstance(c, tuple) else c for c in data.columns]
+                required = ["Date", "Open", "High", "Low", "Close", "Volume"]
+                if all(col in tmp.columns for col in required):
+                    tmp = tmp[required]
+                    tmp["symbol"] = symbol
+                    frames.append(tmp)
 
-            required = ["Date", "Open", "High", "Low", "Close", "Volume"]
-            missing = [c for c in required if c not in data.columns]
-            if missing:
-                continue
+            else:
+                available_symbols = set(data.columns.get_level_values(0))
 
-            data = data[required].copy()
-            data["symbol"] = symbol
-            frames.append(data)
+                for symbol in chunk:
+                    if symbol not in available_symbols:
+                        continue
 
-        except Exception:
+                    tmp = data[symbol].reset_index().copy()
+
+                    required = ["Date", "Open", "High", "Low", "Close", "Volume"]
+                    if not all(col in tmp.columns for col in required):
+                        continue
+
+                    tmp = tmp[required]
+                    tmp["symbol"] = symbol
+                    frames.append(tmp)
+
+        except Exception as e:
+            st.warning(f"Failed batch {start} to {start + chunk_size}: {e}")
             continue
 
     if not frames:
@@ -253,6 +309,7 @@ def fetch_price_data(symbols: Tuple[str, ...], period: str) -> pd.DataFrame:
     prices = pd.concat(frames, ignore_index=True)
     prices = prices.dropna(subset=["Close", "High", "Low", "Open", "Volume"])
     prices = prices.sort_values(["symbol", "Date"])
+
     return prices
 
 
@@ -701,22 +758,65 @@ def plot_stock(symbol: str, indicator_df: pd.DataFrame) -> go.Figure:
 
 def sidebar_config() -> Tuple[List[str], str, ScanConfig, FundamentalConfig, RiskConfig, Optional[pd.DataFrame]]:
     st.sidebar.header("1. Universe")
-
-    uploaded_universe = st.sidebar.file_uploader(
-        "Upload universe CSV",
-        type=["csv"],
-        help="CSV should have Symbol/Ticker column, or symbols in first column.",
+    
+    universe_mode = st.sidebar.radio(
+        "Universe",
+        ["Nifty 500 official", "Custom paste/upload"],
+        index=0,
     )
-
-    raw_symbols = st.sidebar.text_area(
-        "Or paste symbols",
-        value=DEFAULT_UNIVERSE.strip(),
-        height=180,
+    
+    if universe_mode == "Nifty 500 official":
+        try:
+            symbols, nifty500_df = load_nifty500_symbols()
+            st.sidebar.success(f"Loaded {len(symbols)} Nifty 500 symbols")
+    
+            with st.sidebar.expander("Preview Nifty 500 constituents"):
+                st.dataframe(nifty500_df.head(20), use_container_width=True)
+    
+        except Exception as e:
+            st.sidebar.error(f"Could not auto-load Nifty 500 list: {e}")
+            st.sidebar.warning("Fallback: upload the Nifty 500 CSV manually.")
+    
+            uploaded_universe = st.sidebar.file_uploader(
+                "Upload Nifty 500 CSV manually",
+                type=["csv"],
+                key="manual_nifty500_upload",
+            )
+            symbols = parse_symbols("", uploaded_universe)
+    
+    else:
+        uploaded_universe = st.sidebar.file_uploader(
+            "Upload universe CSV",
+            type=["csv"],
+            help="CSV should have Symbol/Ticker column, or symbols in first column.",
+            key="custom_universe_upload",
+        )
+    
+        raw_symbols = st.sidebar.text_area(
+            "Or paste symbols",
+            value=DEFAULT_UNIVERSE.strip(),
+            height=180,
+        )
+    
+        symbols = parse_symbols(raw_symbols, uploaded_universe)
+    
+    max_symbols = st.sidebar.slider(
+        "Max symbols to scan",
+        min_value=50,
+        max_value=500,
+        value=min(500, len(symbols)),
+        step=50,
+        help="Use 50 first for testing. Use 500 for full scan.",
     )
-
-    symbols = parse_symbols(raw_symbols, uploaded_universe)
-
-    period = st.sidebar.selectbox("Price history period", ["6mo", "1y", "2y", "5y"], index=2)
+    
+    symbols = symbols[:max_symbols]
+    
+    period = st.sidebar.selectbox(
+        "Price history period",
+        ["1y", "2y", "5y"],
+        index=1,
+        help="Use at least 1y because SMA200 needs enough history.",
+    )
 
     st.sidebar.header("2. Technical Filters")
 
